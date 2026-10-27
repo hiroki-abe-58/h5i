@@ -381,6 +381,33 @@ enum Attempt<K: Kernel> {
     Replayed(K::Reply),
 }
 
+/// A pooled connection for a write attempt, which may hold session-level
+/// advisory locks. It goes back to the pool only through `release`, after the
+/// locks are released. Dropped any other way (the request was cancelled, or
+/// unlocking failed), it is detached from the pool and closed, so PostgreSQL
+/// releases the locks with the session instead of the next user inheriting
+/// them.
+struct LockedClient(Option<deadpool_postgres::Object>);
+
+impl LockedClient {
+    fn get(&mut self) -> &mut deadpool_postgres::Object {
+        self.0.as_mut().expect("present until released or dropped")
+    }
+
+    fn release(mut self) {
+        drop(self.0.take());
+    }
+}
+
+impl Drop for LockedClient {
+    fn drop(&mut self) {
+        if let Some(client) = self.0.take() {
+            tracing::debug!("closing a connection that may hold advisory locks");
+            drop(deadpool_postgres::Object::take(client));
+        }
+    }
+}
+
 impl<K: Kernel, S: Store<K>> Engine<K, S> {
     pub fn new(pool: Pool, config: EngineConfig) -> Self {
         pool.1.set_capacity(config.statement_cache);
@@ -489,18 +516,15 @@ impl<K: Kernel, S: Store<K>> Engine<K, S> {
         let lock = if self.config.tenant_lock { S::lock_for(actor, cmd) } else { Lock::None };
         for attempt in 0..self.config.max_attempts {
             self.stats.attempts.fetch_add(1, Ordering::Relaxed);
-            let mut client = self.pool.0.get().await.map_err(|e| DbError::Pool(e.to_string()))?;
-            let result = match self.lock(&client, tenant, &lock).await {
-                Ok(()) => {
-                    let r = self.attempt(&mut client, tenant, actor, cmd, idem.as_ref()).await;
-                    self.unlock(&client, &lock).await;
-                    r
-                }
-                Err(e) => {
-                    self.unlock(&client, &lock).await;
-                    Err(e)
-                }
+            let client = self.pool.0.get().await.map_err(|e| DbError::Pool(e.to_string()))?;
+            let mut client = LockedClient(Some(client));
+            let result = match self.lock(client.get(), tenant, &lock).await {
+                Ok(()) => self.attempt(client.get(), tenant, actor, cmd, idem.as_ref()).await,
+                Err(e) => Err(e),
             };
+            if self.unlock(client.get(), &lock).await {
+                client.release();
+            }
             match result {
                 Ok(Attempt::Done(r, writes)) => {
                     if r.is_ok() {
@@ -549,11 +573,10 @@ impl<K: Kernel, S: Store<K>> Engine<K, S> {
         Ok(())
     }
 
-    /// Releases every session-level advisory lock this connection holds.
-    async fn unlock(&self, client: &deadpool_postgres::Object, lock: &Lock) {
-        if *lock != Lock::None {
-            let _ = client.execute("SELECT pg_advisory_unlock_all()", &[]).await;
-        }
+    /// Releases every session-level advisory lock this connection holds; false
+    /// if that may not have happened.
+    async fn unlock(&self, client: &deadpool_postgres::Object, lock: &Lock) -> bool {
+        *lock == Lock::None || client.execute("SELECT pg_advisory_unlock_all()", &[]).await.is_ok()
     }
 
     /// A read-only command: no advisory lock, a `SERIALIZABLE READ ONLY

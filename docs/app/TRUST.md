@@ -96,7 +96,7 @@ EXISTS` on `tenant_id` and given columns), which change no result.
 - App writes, the idempotency reply, `h5i_clock` and outbox rows commit in the same transaction.
 - Keys are stored per `(tenant, ReplyCodec::scope(actor), key)`; reuse with another fingerprint is rejected.
 - A connection lost before COMMIT aborts or retries from BEGIN. If lost during COMMIT, a keyed request retries; an unkeyed one returns `DbError::CommitUnknown`, and the caller must assume neither outcome.
-- Session advisory locks (`Store::lock_for`: the tenant's, or the tenant's shared plus per-key ones) are taken before BEGIN, in one global order (tenant, then keys ascending), and released before the connection returns to the pool. They only queue writes that would otherwise retry; no proof or invariant depends on them.
+- Session advisory locks (`Store::lock_for`: the tenant's, or the tenant's shared plus per-key ones) are taken before BEGIN, in one global order (tenant, then keys ascending), and released before the connection returns to the pool; when that cannot happen (the request is cancelled, or releasing fails), the connection is closed instead, which ends the session and its locks. They only queue writes that would otherwise retry; no proof or invariant depends on them.
 - Outbox deliveries may repeat, keep a stable key, and go only through the destination registry.
 
 Also trusted: the `ReplyCodec` fingerprint and scope, the clock source, the
